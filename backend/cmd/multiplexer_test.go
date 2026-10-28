@@ -2012,12 +2012,18 @@ func callGetOrCreateConnectionConcurrently(t *testing.T, m *Multiplexer, g *gate
 	}
 
 	require.Eventually(t, func() bool { return g.arrived.Load() >= 1 }, 5*time.Second, 5*time.Millisecond)
-	// Give the second caller time to reach the dial. Without sharing it would arrive
-	// at the upstream too, while the first handshake is still held.
-	time.Sleep(100 * time.Millisecond)
 	close(g.release)
 
-	return [2]getOrCreateResult{<-results, <-results}
+	out := [2]getOrCreateResult{<-results, <-results}
+
+	// The sharing invariant: if the in-flight guard worked, the second goroutine
+	// was blocked waiting for the first dial to finish and never reached the TLS
+	// handler. So exactly one request should have arrived at the upstream.
+	assert.EqualValues(t, 1, g.arrived.Load(),
+		"only the dialing goroutine should have reached the upstream; "+
+			"the waiter must have been held by the in-flight guard")
+
+	return out
 }
 
 func newMultiplexerForGatedUpstream(t *testing.T, g *gatedUpstream) *Multiplexer {
