@@ -1,21 +1,4 @@
-/*
-Copyright 2025 The Kubernetes Authors.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
-
 package main
-
 import (
 	"crypto/tls"
 	"encoding/base64"
@@ -42,7 +25,7 @@ func newTestDialer() *websocket.Dialer {
 	return &websocket.Dialer{
 		NetDial:          net.Dial,
 		HandshakeTimeout: 45 * time.Second,
-		TLSClientConfig:  &tls.Config{InsecureSkipVerify: true}, //nolint:gosec
+		TLSClientConfig:  &tls.Config{InsecureSkipVerify: true}, 
 	}
 }
 
@@ -61,7 +44,6 @@ func TestHandleClientWebSocket(t *testing.T) {
 	contextStore := kubeconfig.NewContextStore()
 	m := NewMultiplexer(contextStore, false)
 
-	// Create test server
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		m.HandleClientWebSocket(w, r)
 	}))
@@ -82,7 +64,7 @@ func TestHandleClientWebSocket(t *testing.T) {
 
 	wsConn := NewWSConnLock(ws)
 
-	// Test WATCH message
+	
 	watchMsg := Message{
 		Type:      "WATCH",
 		ClusterID: "test-cluster",
@@ -233,9 +215,7 @@ func TestDialWebSocket_Errors(t *testing.T) {
 	assert.Nil(t, ws)
 }
 
-// TestDialWebSocket_BadHandshakeLogging verifies that when a WebSocket dial fails
-// due to a bad handshake (e.g., connecting to an HTTP server instead of a WebSocket),
-// the error logging doesn't cause JSON marshaling errors from function fields in the response.
+
 func TestDialWebSocket_BadHandshakeLogging(t *testing.T) {
 	// Create an HTTP server that returns a non-WebSocket response
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2024,12 +2004,18 @@ func callGetOrCreateConnectionConcurrently(t *testing.T, m *Multiplexer, g *gate
 	}
 
 	require.Eventually(t, func() bool { return g.arrived.Load() >= 1 }, 5*time.Second, 5*time.Millisecond)
-	// Give the second caller time to reach the dial. Without sharing it would arrive
-	// at the upstream too, while the first handshake is still held.
-	time.Sleep(100 * time.Millisecond)
 	g.releaseHandshakes()
 
-	return [2]getOrCreateResult{<-results, <-results}
+	out := [2]getOrCreateResult{<-results, <-results}
+
+	// The sharing invariant: if the in-flight guard worked, the second goroutine
+	// was blocked waiting for the first dial to finish and never reached the TLS
+	// handler. So exactly one request should have arrived at the upstream.
+	assert.EqualValues(t, 1, g.arrived.Load(),
+		"only the dialing goroutine should have reached the upstream; "+
+			"the waiter must have been held by the in-flight guard")
+
+	return out
 }
 
 func newMultiplexerForGatedUpstream(t *testing.T, g *gatedUpstream) *Multiplexer {
@@ -2083,6 +2069,54 @@ func TestGetOrCreateConnection_ConcurrentDialFailure(t *testing.T) {
 	assert.Empty(t, m.connections)
 	assert.Empty(t, m.inFlight, "a failed dial should not stay in flight")
 	m.mutex.RUnlock()
+}
+
+func TestGetOrCreateConnection_ConcurrentWaiterRefreshesToken(t *testing.T) {
+	g := newGatedUpstream(t, false)
+	m := newMultiplexerForGatedUpstream(t, g)
+
+	clientConn, clientServer := createTestWebSocketConnection()
+	defer clientServer.Close()
+
+	msg := Message{ClusterID: "test-cluster", Path: "/api/v1/pods", Query: "watch=true", UserID: "test-user"}
+	token1 := "token-initial"
+	token2 := "token-refreshed"
+
+	results := make(chan getOrCreateResult, 2)
+
+	// Initiator starts dial with token1
+	go func() {
+		conn, err := m.getOrCreateConnection(msg, clientConn, &token1)
+		results <- getOrCreateResult{conn, err}
+	}()
+
+	// Wait until initiator reaches the upstream handshake
+	require.Eventually(t, func() bool { return g.arrived.Load() >= 1 }, 5*time.Second, 5*time.Millisecond)
+
+	// Waiter arrives with token2 while dial is in-flight
+	go func() {
+		conn, err := m.getOrCreateConnection(msg, clientConn, &token2)
+		results <- getOrCreateResult{conn, err}
+	}()
+
+	// Release handshake to let dial complete
+	g.releaseHandshakes()
+
+	first, second := <-results, <-results
+	require.NoError(t, first.err)
+	require.NoError(t, second.err)
+	assert.Same(t, first.conn, second.conn)
+
+	// Waiter should have updated the connection token via refreshConnectionToken
+	first.conn.mu.RLock()
+	tokenVal := ""
+	if first.conn.Token != nil {
+		tokenVal = *first.conn.Token
+	}
+	first.conn.mu.RUnlock()
+	assert.Equal(t, token2, tokenVal)
+
+	m.cleanupConnections()
 }
 
 func TestGetOrCreateConnection_InFlightIsPerKey(t *testing.T) {
